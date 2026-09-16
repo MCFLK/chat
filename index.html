@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -437,7 +436,7 @@
             border-radius: 8px;
             border: 2px solid var(--primary-color);
             z-index: 61;
-            cursor: move;
+            cursor: grab;
             background: #222;
         }
 
@@ -668,10 +667,11 @@
         getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, onAuthStateChanged 
     } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-auth.js";
     import { 
-        getDatabase, ref, set, get, child, onValue, push, update, remove, onDisconnect, serverTimestamp, query, orderByChild, equalTo 
+        getDatabase, ref, set, get, child, onValue, push, update, remove, onDisconnect, serverTimestamp, query, orderByChild, equalTo, runTransaction 
     } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-database.js";
 
     // --- Firebase Configuration ---
+    // ⚠️ WARNING: Replace with your actual config. Ensure database rules allow authenticated reads/writes.
     const firebaseConfig = {
         apiKey: "AIzaSyCsTasTcFUTfVDlREZUvI3AnKB6A75hpT4",
         authDomain: "chat-3f0db.firebaseapp.com",
@@ -695,10 +695,15 @@
     let pc = null; // RTCPeerConnection instance
     let localStream = null;
     let currentCallId = null;
+    let currentCallPeerId = null; // FIX: Track who we are calling/receiving from
     let callType = null; // 'voice' or 'video'
     let isCaller = false;
     let callStartTime = null;
     let isMuted = false;
+    let appInitialized = false; // FIX: Prevent duplicate listeners
+
+    // FIX: Store chat listeners to clean them up when closing chat
+    let chatListeners = []; 
 
     // WebRTC STUN Servers
     const rtcConfig = {
@@ -731,10 +736,12 @@
     }
 
     function stopRingtone() {
-        if (ringtoneLoop) {
-            ringtoneLoop.stop();
-            Tone.Transport.stop();
-        }
+        try {
+            if (ringtoneLoop) {
+                ringtoneLoop.stop();
+                Tone.Transport.stop();
+            }
+        } catch(e) { console.error(e); }
     }
 
     // --- SVG Data URL Avatar Generator ---
@@ -811,14 +818,22 @@
                 showModal('profile-modal');
             } else {
                 currentUserData = snap.val();
-                initPresence();
                 loadUserDataUI();
-                listenForContacts();
-                listenForRequests();
-                listenForCallsIncoming();
-                listenForCallLogs();
+                
+                // FIX: Only initialize listeners once per session
+                if (!appInitialized) {
+                    appInitialized = true;
+                    initPresence();
+                    listenForContacts();
+                    listenForRequests();
+                    listenForCallsIncoming();
+                    listenForCallLogs();
+                }
             }
         } else {
+            currentUser = null;
+            currentUserData = null;
+            appInitialized = false;
             showModal('auth-modal');
         }
     });
@@ -831,7 +846,12 @@
 
         if (!name) return alert('Name is required');
 
-        const userIdTag = 'ar-' + Math.floor(1000 + Math.random() * 9000);
+        // FIX: Retain existing User ID if editing profile. Only generate on first setup.
+        let userIdTag = currentUserData?.userId;
+        if (!userIdTag) {
+            userIdTag = 'ar-' + Math.floor(1000 + Math.random() * 9000);
+        }
+        
         const dpUrl = emojiToSVG(emoji);
 
         const profileData = {
@@ -848,12 +868,16 @@
 
         currentUserData = profileData;
         hideModal('profile-modal');
-        initPresence();
         loadUserDataUI();
-        listenForContacts();
-        listenForRequests();
-        listenForCallsIncoming();
-        listenForCallLogs();
+        
+        if (!appInitialized) {
+            appInitialized = true;
+            initPresence();
+            listenForContacts();
+            listenForRequests();
+            listenForCallsIncoming();
+            listenForCallLogs();
+        }
     });
 
     document.getElementById('edit-profile-btn').addEventListener('click', () => {
@@ -1065,24 +1089,35 @@
         // Reset Unread Count
         await set(ref(db, `unreadCounts/${currentUser.uid}/${activeChatId}`), 0);
 
+        // FIX: Clean up previous listeners before adding new ones
+        chatListeners.forEach(unsub => unsub());
+        chatListeners = [];
+
         // Friend Presence in Chat Header
-        onValue(ref(db, `status/${friendData.uid}`), (sSnap) => {
+        const unsubStatus = onValue(ref(db, `status/${friendData.uid}`), (sSnap) => {
             const st = sSnap.val();
             document.getElementById('chat-header-status').textContent = 
                 (st && st.state === 'online') ? 'Online' : 'Offline';
         });
+        chatListeners.push(unsubStatus);
 
         // Listen for Typing Indicator
-        onValue(ref(db, `typing/${activeChatId}/${activeChatUserId}`), (tSnap) => {
+        const unsubTyping = onValue(ref(db, `typing/${activeChatId}/${activeChatUserId}`), (tSnap) => {
             const isTyping = tSnap.val();
             document.getElementById('typing-indicator').textContent = isTyping ? `${friendData.name} is typing...` : '';
         });
+        chatListeners.push(unsubTyping);
 
         loadMessages();
     }
 
     document.getElementById('close-chat-btn').addEventListener('click', () => {
         document.getElementById('chat-view').classList.remove('active');
+        
+        // FIX: Clean up listeners
+        chatListeners.forEach(unsub => unsub());
+        chatListeners = [];
+        
         activeChatUserId = null;
         activeChatId = null;
     });
@@ -1104,7 +1139,10 @@
         const clearedSnap = await get(ref(db, `userChats/${currentUser.uid}/${activeChatId}/clearedAt`));
         const clearedAt = clearedSnap.val() || 0;
 
-        onValue(ref(db, `messages/${activeChatId}`), (mSnap) => {
+        const unsubMsgs = onValue(ref(db, `messages/${activeChatId}`), (mSnap) => {
+            // FIX: Check if user is scrolled to bottom before clearing and re-rendering
+            const isScrolledToBottom = messagesContainer.scrollHeight - messagesContainer.clientHeight <= messagesContainer.scrollTop + 50;
+            
             messagesContainer.innerHTML = '';
             const msgs = mSnap.val();
 
@@ -1118,9 +1156,13 @@
                         messagesContainer.appendChild(b);
                     }
                 });
-                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                
+                if (isScrolledToBottom) {
+                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                }
             }
         });
+        chatListeners.push(unsubMsgs);
     }
 
     // Message Input & Typing Handler
@@ -1150,11 +1192,11 @@
 
         await push(ref(db, `messages/${activeChatId}`), msgData);
 
-        // Increment Unread Count for Receiver
+        // Increment Unread Count for Receiver using Transaction to prevent race conditions
         const unreadRef = ref(db, `unreadCounts/${activeChatUserId}/${activeChatId}`);
-        const snap = await get(unreadRef);
-        const curr = snap.val() || 0;
-        await set(unreadRef, curr + 1);
+        runTransaction(unreadRef, (curr) => {
+            return (curr || 0) + 1;
+        });
     }
 
     document.getElementById('send-btn').addEventListener('click', sendMessage);
@@ -1169,15 +1211,22 @@
     async function initiateCall(type) {
         callType = type;
         isCaller = true;
+        currentCallPeerId = activeChatUserId; // FIX: Track peer
         currentCallId = getChatId(currentUser.uid, activeChatUserId);
 
         setupCallUI(type, activeChatUserId);
         showModal('call-screen');
 
-        localStream = await navigator.mediaDevices.getUserMedia({
-            audio: true,
-            video: type === 'video'
-        });
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+                audio: true,
+                video: type === 'video'
+            });
+        } catch (err) {
+            alert("Could not access camera/microphone. Please allow permissions.");
+            hideModal('call-screen');
+            return;
+        }
 
         document.getElementById('localVideo').srcObject = localStream;
 
@@ -1212,17 +1261,21 @@
         onValue(child(callRef, 'answer'), async (snap) => {
             const answer = snap.val();
             if (answer && pc && !pc.currentRemoteDescription) {
-                await pc.setRemoteDescription(new RTCSessionDescription(answer));
-                callStartTime = Date.now();
-                document.getElementById('call-status').textContent = 'Connected';
+                try {
+                    await pc.setRemoteDescription(new RTCSessionDescription(answer));
+                    callStartTime = Date.now();
+                    document.getElementById('call-status').textContent = 'Connected';
+                } catch(e) { console.error("Error setting remote description", e); }
             }
         });
 
         // Listen for Callee Candidates
         onValue(child(callRef, 'calleeCandidates'), (snap) => {
             snap.forEach((childSnap) => {
-                const candidate = new RTCIceCandidate(childSnap.val());
-                pc.addIceCandidate(candidate);
+                try {
+                    const candidate = new RTCIceCandidate(childSnap.val());
+                    pc.addIceCandidate(candidate);
+                } catch(e) { console.error("Error adding ICE candidate", e); }
             });
         });
 
@@ -1236,14 +1289,18 @@
 
     // Callee Listener for Incoming Calls
     function listenForCallsIncoming() {
-        onValue(ref(db, 'calls'), async (snap) => {
+        // FIX: Query only calls where receiver is current user to save bandwidth
+        const callsQuery = query(ref(db, 'calls'), orderByChild('receiver'), equalTo(currentUser.uid));
+        
+        onValue(callsQuery, async (snap) => {
             const calls = snap.val();
             if (!calls) return;
 
             Object.keys(calls).forEach(async (cId) => {
                 const call = calls[cId];
-                if (call.receiver === currentUser.uid && call.status === 'calling') {
+                if (call.status === 'calling' && !currentCallId) { // Only handle if not already in a call
                     currentCallId = cId;
+                    currentCallPeerId = call.caller; // FIX: Track peer
                     callType = call.type;
 
                     const callerSnap = await get(ref(db, `users/${call.caller}`));
@@ -1270,10 +1327,16 @@
 
         setupCallUI(call.type, call.caller);
 
-        localStream = await navigator.mediaDevices.getUserMedia({
-            audio: true,
-            video: call.type === 'video'
-        });
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+                audio: true,
+                video: call.type === 'video'
+            });
+        } catch (err) {
+            alert("Could not access camera/microphone.");
+            rejectCall();
+            return;
+        }
 
         document.getElementById('localVideo').srcObject = localStream;
 
@@ -1293,31 +1356,39 @@
             }
         };
 
-        await pc.setRemoteDescription(new RTCSessionDescription(call.offer));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
+        try {
+            await pc.setRemoteDescription(new RTCSessionDescription(call.offer));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
 
-        await update(callRef, {
-            answer: { type: answer.type, sdp: answer.sdp },
-            status: 'connected'
-        });
-
-        callStartTime = Date.now();
-
-        // Listen for Caller ICE Candidates
-        onValue(child(callRef, 'callerCandidates'), (snap) => {
-            snap.forEach((childSnap) => {
-                const candidate = new RTCIceCandidate(childSnap.val());
-                pc.addIceCandidate(candidate);
+            await update(callRef, {
+                answer: { type: answer.type, sdp: answer.sdp },
+                status: 'connected'
             });
-        });
 
-        // Listen for Call Termination
-        onValue(child(callRef, 'status'), (snap) => {
-            if (snap.val() === 'ended') {
-                cleanUpCall();
-            }
-        });
+            callStartTime = Date.now();
+            document.getElementById('call-status').textContent = 'Connected';
+
+            // Listen for Caller ICE Candidates
+            onValue(child(callRef, 'callerCandidates'), (snap) => {
+                snap.forEach((childSnap) => {
+                    try {
+                        const candidate = new RTCIceCandidate(childSnap.val());
+                        pc.addIceCandidate(candidate);
+                    } catch(e) { console.error("Error adding ICE candidate", e); }
+                });
+            });
+
+            // Listen for Call Termination
+            onValue(child(callRef, 'status'), (snap) => {
+                if (snap.val() === 'ended') {
+                    cleanUpCall();
+                }
+            });
+        } catch(e) {
+            console.error("Error accepting call", e);
+            cleanUpCall();
+        }
     });
 
     document.getElementById('reject-call-btn').addEventListener('click', async () => {
@@ -1325,8 +1396,10 @@
         hideModal('incoming-call-modal');
         if (currentCallId) {
             await update(ref(db, `calls/${currentCallId}`), { status: 'rejected' });
-            logCall('missed', 0);
+            logCall('missed', 0, currentCallPeerId);
             remove(ref(db, `calls/${currentCallId}`));
+            currentCallId = null;
+            currentCallPeerId = null;
         }
     });
 
@@ -1348,7 +1421,7 @@
 
     // Call Actions (Mute & End)
     document.getElementById('toggle-audio-btn').addEventListener('click', () => {
-        if (localStream) {
+        if (localStream && localStream.getAudioTracks().length > 0) {
             isMuted = !isMuted;
             localStream.getAudioTracks()[0].enabled = !isMuted;
             document.getElementById('toggle-audio-btn').style.backgroundColor = isMuted ? 'var(--danger-color)' : 'var(--container-bg)';
@@ -1365,8 +1438,12 @@
     function cleanUpCall() {
         stopRingtone();
         const duration = callStartTime ? Math.round((Date.now() - callStartTime) / 1000) : 0;
+        
         if (currentCallId) {
-            logCall(duration > 0 ? callType : 'missed', duration);
+            // FIX: Only log if we actually connected or it was an outgoing call
+            if (callStartTime || isCaller) {
+                logCall(duration > 0 ? callType : 'missed', duration, currentCallPeerId);
+            }
             remove(ref(db, `calls/${currentCallId}`));
         }
 
@@ -1380,16 +1457,20 @@
         hideModal('incoming-call-modal');
         callStartTime = null;
         currentCallId = null;
+        currentCallPeerId = null;
+        isCaller = false;
+        isMuted = false;
+        document.getElementById('toggle-audio-btn').style.backgroundColor = 'var(--container-bg)';
     }
 
     // --- Call Logging ---
-    async function logCall(type, duration) {
-        if (!currentCallId) return;
+    async function logCall(type, duration, peerId) {
+        if (!peerId) return;
         const logData = {
             type: type,
             duration: duration,
             timestamp: serverTimestamp(),
-            peer: activeChatUserId || currentUser.uid
+            peer: peerId // FIX: Use the tracked peer ID instead of activeChatUserId
         };
         await push(ref(db, `callLogs/${currentUser.uid}`), logData);
     }
@@ -1430,23 +1511,27 @@
     const localVideoEl = document.getElementById("localVideo");
     let isDragging = false, currentX, currentY, initialX, initialY, xOffset = 0, yOffset = 0;
 
-    localVideoEl.addEventListener("touchstart", dragStart, false);
-    localVideoEl.addEventListener("touchend", dragEnd, false);
-    localVideoEl.addEventListener("touchmove", drag, false);
-    localVideoEl.addEventListener("mousedown", dragStart, false);
-    localVideoEl.addEventListener("mouseup", dragEnd, false);
-    localVideoEl.addEventListener("mousemove", drag, false);
+    localVideoEl.addEventListener("touchstart", dragStart, { passive: false });
+    localVideoEl.addEventListener("touchend", dragEnd);
+    localVideoEl.addEventListener("touchmove", drag, { passive: false });
+    localVideoEl.addEventListener("mousedown", dragStart);
+    localVideoEl.addEventListener("mouseup", dragEnd);
+    localVideoEl.addEventListener("mousemove", drag);
 
     function dragStart(e) {
         initialX = (e.type === "touchstart" ? e.touches[0].clientX : e.clientX) - xOffset;
         initialY = (e.type === "touchstart" ? e.touches[0].clientY : e.clientY) - yOffset;
-        if (e.target === localVideoEl) isDragging = true;
+        if (e.target === localVideoEl) {
+            isDragging = true;
+            localVideoEl.style.cursor = 'grabbing';
+        }
     }
 
     function dragEnd() {
         initialX = currentX;
         initialY = currentY;
         isDragging = false;
+        localVideoEl.style.cursor = 'grab';
     }
 
     function drag(e) {
@@ -1454,7 +1539,8 @@
             e.preventDefault();
             currentX = (e.type === "touchmove" ? e.touches[0].clientX : e.clientX) - initialX;
             currentY = (e.type === "touchmove" ? e.touches[0].clientY : e.clientY) - initialY;
-            xOffset = currentX; yOffset = currentY;
+            xOffset = currentX; 
+            yOffset = currentY;
             localVideoEl.style.transform = `translate3d(${currentX}px, ${currentY}px, 0)`;
         }
     }
