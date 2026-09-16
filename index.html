@@ -671,7 +671,6 @@
     } from "https://www.gstatic.com/firebasejs/9.23.0/firebase-database.js";
 
     // --- Firebase Configuration ---
-    // ⚠️ WARNING: Replace with your actual config. Ensure database rules allow authenticated reads/writes.
     const firebaseConfig = {
         apiKey: "AIzaSyCsTasTcFUTfVDlREZUvI3AnKB6A75hpT4",
         authDomain: "chat-3f0db.firebaseapp.com",
@@ -695,19 +694,30 @@
     let pc = null; // RTCPeerConnection instance
     let localStream = null;
     let currentCallId = null;
-    let currentCallPeerId = null; // FIX: Track who we are calling/receiving from
+    let currentCallPeerId = null; // Track who we are calling/receiving from
     let callType = null; // 'voice' or 'video'
     let isCaller = false;
     let callStartTime = null;
     let isMuted = false;
-    let appInitialized = false; // FIX: Prevent duplicate listeners
+    let appInitialized = false; // Prevent duplicate listeners
+    let chatListeners = []; // Store chat listeners to clean them up
 
-    // FIX: Store chat listeners to clean them up when closing chat
-    let chatListeners = []; 
-
-    // WebRTC STUN Servers
+    // --- WebRTC STUN & TURN Servers (Crucial for cross-network calls) ---
     const rtcConfig = {
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            {
+                urls: 'turn:openrelay.metered.ca:80',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            },
+            {
+                urls: 'turn:openrelay.metered.ca:443',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            }
+        ]
     };
 
     // --- Tone.js Ringtone Synthesis ---
@@ -820,7 +830,7 @@
                 currentUserData = snap.val();
                 loadUserDataUI();
                 
-                // FIX: Only initialize listeners once per session
+                // Only initialize listeners once per session
                 if (!appInitialized) {
                     appInitialized = true;
                     initPresence();
@@ -846,7 +856,7 @@
 
         if (!name) return alert('Name is required');
 
-        // FIX: Retain existing User ID if editing profile. Only generate on first setup.
+        // Retain existing User ID if editing profile. Only generate on first setup.
         let userIdTag = currentUserData?.userId;
         if (!userIdTag) {
             userIdTag = 'ar-' + Math.floor(1000 + Math.random() * 9000);
@@ -1089,7 +1099,7 @@
         // Reset Unread Count
         await set(ref(db, `unreadCounts/${currentUser.uid}/${activeChatId}`), 0);
 
-        // FIX: Clean up previous listeners before adding new ones
+        // Clean up previous listeners before adding new ones
         chatListeners.forEach(unsub => unsub());
         chatListeners = [];
 
@@ -1114,7 +1124,7 @@
     document.getElementById('close-chat-btn').addEventListener('click', () => {
         document.getElementById('chat-view').classList.remove('active');
         
-        // FIX: Clean up listeners
+        // Clean up listeners
         chatListeners.forEach(unsub => unsub());
         chatListeners = [];
         
@@ -1140,7 +1150,7 @@
         const clearedAt = clearedSnap.val() || 0;
 
         const unsubMsgs = onValue(ref(db, `messages/${activeChatId}`), (mSnap) => {
-            // FIX: Check if user is scrolled to bottom before clearing and re-rendering
+            // Check if user is scrolled to bottom before clearing and re-rendering
             const isScrolledToBottom = messagesContainer.scrollHeight - messagesContainer.clientHeight <= messagesContainer.scrollTop + 50;
             
             messagesContainer.innerHTML = '';
@@ -1211,7 +1221,7 @@
     async function initiateCall(type) {
         callType = type;
         isCaller = true;
-        currentCallPeerId = activeChatUserId; // FIX: Track peer
+        currentCallPeerId = activeChatUserId; // Track peer
         currentCallId = getChatId(currentUser.uid, activeChatUserId);
 
         setupCallUI(type, activeChatUserId);
@@ -1234,7 +1244,10 @@
         localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
         pc.ontrack = (event) => {
-            document.getElementById('remoteVideo').srcObject = event.streams[0];
+            const remoteVideo = document.getElementById('remoteVideo');
+            remoteVideo.srcObject = event.streams[0];
+            // Force play to bypass autoplay policies
+            remoteVideo.play().catch(e => console.log("Autoplay blocked:", e));
         };
 
         const callRef = ref(db, `calls/${currentCallId}`);
@@ -1289,7 +1302,7 @@
 
     // Callee Listener for Incoming Calls
     function listenForCallsIncoming() {
-        // FIX: Query only calls where receiver is current user to save bandwidth
+        // Query only calls where receiver is current user to save bandwidth
         const callsQuery = query(ref(db, 'calls'), orderByChild('receiver'), equalTo(currentUser.uid));
         
         onValue(callsQuery, async (snap) => {
@@ -1300,7 +1313,7 @@
                 const call = calls[cId];
                 if (call.status === 'calling' && !currentCallId) { // Only handle if not already in a call
                     currentCallId = cId;
-                    currentCallPeerId = call.caller; // FIX: Track peer
+                    currentCallPeerId = call.caller; // Track peer
                     callType = call.type;
 
                     const callerSnap = await get(ref(db, `users/${call.caller}`));
@@ -1344,7 +1357,10 @@
         localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
         pc.ontrack = (event) => {
-            document.getElementById('remoteVideo').srcObject = event.streams[0];
+            const remoteVideo = document.getElementById('remoteVideo');
+            remoteVideo.srcObject = event.streams[0];
+            // Force play to bypass autoplay policies
+            remoteVideo.play().catch(e => console.log("Autoplay blocked:", e));
         };
 
         const callRef = ref(db, `calls/${currentCallId}`);
@@ -1440,7 +1456,7 @@
         const duration = callStartTime ? Math.round((Date.now() - callStartTime) / 1000) : 0;
         
         if (currentCallId) {
-            // FIX: Only log if we actually connected or it was an outgoing call
+            // Only log if we actually connected or it was an outgoing call
             if (callStartTime || isCaller) {
                 logCall(duration > 0 ? callType : 'missed', duration, currentCallPeerId);
             }
@@ -1470,7 +1486,7 @@
             type: type,
             duration: duration,
             timestamp: serverTimestamp(),
-            peer: peerId // FIX: Use the tracked peer ID instead of activeChatUserId
+            peer: peerId // Use the tracked peer ID instead of activeChatUserId
         };
         await push(ref(db, `callLogs/${currentUser.uid}`), logData);
     }
