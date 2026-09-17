@@ -148,14 +148,7 @@
         .message-bubble.me .message-time .lock-icon{color:rgba(255,255,255,0.9);}
         .message-bubble.failed-decrypt{background:rgba(244,63,94,0.15) !important;border-color:rgba(244,63,94,0.4) !important;color:var(--text-secondary) !important;font-style:italic;}
 
-        /* ✅ WHATSAPP-STYLE DELIVERY TICKS */
-        .ticks {
-            font-size: 0.72rem;
-            display: inline-flex;
-            align-items: center;
-            margin-left: 2px;
-            transition: color 0.25s ease;
-        }
+        .ticks { font-size: 0.72rem; display: inline-flex; align-items: center; margin-left: 2px; transition: color 0.25s ease; }
         .ticks.sent { color: rgba(255,255,255,0.55); }
         .ticks.delivered { color: rgba(255,255,255,0.95); }
         .ticks.seen { color: #53bdeb; }
@@ -725,6 +718,19 @@
         sharedKey: null
     };
 
+    // ✅ FIX: Prevent duplicate sends
+    let __sendLock = false;
+    let __lastSendText = '';
+    let __lastSendTime = 0;
+
+    // ✅ FIX: Prevent duplicate openChatView calls
+    let __openingChatId = null;
+    let __lastOpenTime = 0;
+
+    // ✅ FIX: Render throttle
+    let __renderScheduled = false;
+    let __lastRenderKey = '';
+
     const isDesktop = () => window.matchMedia('(min-width: 1024px)').matches;
 
     const rtcConfig = {
@@ -982,7 +988,7 @@
 
     window.addEventListener('hashchange', () => {
         if (!location.hash.startsWith('#chat/')) {
-            chatListeners.forEach(u => u()); chatListeners = [];
+            chatListeners.forEach(u => { try { u(); } catch(e){} }); chatListeners = [];
             activeChatUserId = null; activeChatId = null; activeChatUserData = null;
             document.getElementById('chat-action-sheet').classList.remove('open');
             document.getElementById('chat-panel').classList.remove('active');
@@ -1228,7 +1234,6 @@
         });
     }
 
-    // ✅ Mark this chat as read by me
     async function markChatAsRead() {
         if (!activeChatId || !currentUser) return;
         try {
@@ -1238,6 +1243,14 @@
     }
 
     async function openChatView(friendData, updateHash = true) {
+        // ✅ FIX: Dedupe rapid openChatView calls for same chat
+        const now = Date.now();
+        if (__openingChatId === friendData.uid && (now - __lastOpenTime) < 400) {
+            return;
+        }
+        __openingChatId = friendData.uid;
+        __lastOpenTime = now;
+
         activeChatUserId = friendData.uid;
         activeChatUserData = friendData;
         activeChatId = getChatId(currentUser.uid, friendData.uid);
@@ -1247,9 +1260,12 @@
         document.getElementById('chat-panel').classList.add('active');
         if (updateHash) navigateTo(`#chat/${friendData.userId}`);
 
-        chatListeners.forEach(u => u()); chatListeners = [];
+        // ✅ FIX: Properly unsubscribe previous listeners
+        if (Array.isArray(chatListeners)) {
+            chatListeners.forEach(u => { try { u(); } catch(e) {} });
+        }
+        chatListeners = [];
 
-        // Reset message state
         currentMessagesState = {
             msgs: [],
             peerReadTime: 0,
@@ -1258,29 +1274,25 @@
             sharedKey: null
         };
 
-        // Peer's online status
         chatListeners.push(onValue(ref(db, `status/${friendData.uid}`), (s) => {
             const st = s.val();
             const online = !!(st && st.state === 'online');
             currentMessagesState.peerOnline = online;
             document.getElementById('chat-header-status').textContent = online ? 'Online' : 'Offline';
-            renderMessages();
+            scheduleRender();
         }));
 
-        // Peer's read timestamp
         chatListeners.push(onValue(ref(db, `reads/${activeChatId}/${friendData.uid}`), (s) => {
             currentMessagesState.peerReadTime = s.val() || 0;
-            renderMessages();
+            scheduleRender();
         }));
 
-        // Typing
         chatListeners.push(onValue(ref(db, `typing/${activeChatId}/${activeChatUserId}`), (t) => {
             const isTyping = t.val();
             document.getElementById('typing-text').textContent = isTyping ? `${friendData.name} is typing` : '';
             document.getElementById('typing-dots').classList.toggle('active', !!isTyping);
         }));
 
-        // Block status
         chatListeners.push(onValue(ref(db, `blocks/${currentUser.uid}/${friendData.uid}`), (s) => {
             iBlockedThem = s.exists(); updateBlockUI();
         }));
@@ -1288,31 +1300,26 @@
             theyBlockedMe = s.exists(); updateBlockUI();
         }));
 
-        // Peer's pubkey changes → refresh shared key
         chatListeners.push(onValue(ref(db, `pubkeys/${friendData.uid}`), async () => {
             delete sharedKeyCache[activeChatId];
             const shared = await getOrCreateSharedKey(friendData.uid);
             currentMessagesState.sharedKey = shared;
             updateEncryptionPill(friendData.uid);
-            renderMessages();
+            scheduleRender();
         }));
 
-        // Messages
         chatListeners.push(onValue(ref(db, `messages/${activeChatId}`), (s) => {
             const msgs = s.val();
             currentMessagesState.msgs = msgs
                 ? Object.values(msgs).sort((a,b) => (a.timestamp||0) - (b.timestamp||0))
                 : [];
-            renderMessages();
-            // Any incoming message while we're viewing → mark read
+            scheduleRender();
             markChatAsRead();
         }));
 
-        // Cleared-at
         const clearedAt = (await get(ref(db, `userChats/${currentUser.uid}/${activeChatId}/clearedAt`))).val() || 0;
         currentMessagesState.clearedAt = clearedAt;
 
-        // Encryption setup
         try {
             await ensureMyKeys();
             const shared = await getOrCreateSharedKey(friendData.uid);
@@ -1320,10 +1327,18 @@
             await updateEncryptionPill(friendData.uid);
         } catch(e) { console.warn('Encryption setup failed', e); }
 
-        // Mark as read NOW (opening the chat = read)
         await markChatAsRead();
+        scheduleRender();
+    }
 
-        renderMessages();
+    // ✅ FIX: Throttle renders so listeners firing 3x at once don't stack
+    function scheduleRender() {
+        if (__renderScheduled) return;
+        __renderScheduled = true;
+        setTimeout(async () => {
+            __renderScheduled = false;
+            await renderMessages();
+        }, 30);
     }
 
     function updateBlockUI() {
@@ -1357,8 +1372,9 @@
         if (isDesktop()) {
             document.getElementById('chat-view').classList.remove('active');
             document.getElementById('chat-panel').classList.remove('active');
-            chatListeners.forEach(u => u()); chatListeners = [];
+            chatListeners.forEach(u => { try { u(); } catch(e){} }); chatListeners = [];
             activeChatUserId = null; activeChatId = null; activeChatUserData = null;
+            __openingChatId = null;
             history.replaceState(null, '', '#chats');
             handleRoute();
         } else {
@@ -1382,7 +1398,7 @@
             await set(ref(db, `unreadCounts/${currentUser.uid}/${activeChatId}`), 0);
             currentMessagesState.clearedAt = Date.now();
             haptic(30); showToast('Chat cleared for you', 'success');
-            renderMessages();
+            scheduleRender();
         }
     });
 
@@ -1397,7 +1413,7 @@
             await remove(ref(db, `reads/${activeChatId}`));
             haptic([30, 50, 30]); showToast('All messages deleted', 'success');
             currentMessagesState.msgs = [];
-            renderMessages();
+            scheduleRender();
         }
     });
 
@@ -1424,7 +1440,7 @@
                         await remove(ref(db, `unreadCounts/${currentUser.uid}/${activeChatId}`));
                         haptic(30); showToast('History cleared', 'success');
                         currentMessagesState.msgs = [];
-                        renderMessages();
+                        scheduleRender();
                     }
                 }, 400);
             }
@@ -1459,7 +1475,6 @@
         });
     }
 
-    // ✅ RENDER MESSAGES (with ticks)
     async function renderMessages() {
         const container = document.getElementById('chat-messages');
         if (!container) return;
@@ -1495,18 +1510,14 @@
                 }
             }
 
-            // ✅ TICKS: 1 grey / 2 grey / 2 blue
             let ticksHtml = '';
             if (mine && !failed) {
                 const msgTime = m.timestamp || Date.now();
                 if (peerReadTime && msgTime <= peerReadTime) {
-                    // Recipient has read it → blue double ticks
                     ticksHtml = '<i class="fa-solid fa-check-double ticks seen"></i>';
                 } else if (peerOnline) {
-                    // Recipient is online → grey double ticks
                     ticksHtml = '<i class="fa-solid fa-check-double ticks delivered"></i>';
                 } else {
-                    // Sent only → grey single tick
                     ticksHtml = '<i class="fa-solid fa-check ticks sent"></i>';
                 }
             }
@@ -1534,42 +1545,67 @@
         typingTimeout = setTimeout(() => set(ref(db, `typing/${activeChatId}/${currentUser.uid}`), false), 3000);
     });
 
+    // ✅ FIX: sendMessage with dedupe lock
     async function sendMessage() {
+        // ✅ FIX: Block if already sending
+        if (__sendLock) return;
+
         if (iBlockedThem || theyBlockedMe) {
             showToast(iBlockedThem ? 'Unblock user to send messages' : 'You cannot message this user', 'danger');
             haptic(30); return;
         }
         const text = msgInput.value.trim();
         if (!text || !activeChatId) return;
+
+        // ✅ FIX: Dedupe same text sent within 700ms (mobile fires click+keydown)
+        const now = Date.now();
+        if (text === __lastSendText && (now - __lastSendTime) < 700) return;
+        __lastSendText = text;
+        __lastSendTime = now;
+
+        __sendLock = true;
+        // Clear input immediately so any duplicate handler sees empty
         msgInput.value = '';
         set(ref(db, `typing/${activeChatId}/${currentUser.uid}`), false);
 
-        let payload = text;
-        let encrypted = false;
-        const shared = currentMessagesState.sharedKey || await getOrCreateSharedKey(activeChatUserId);
-        if (shared) {
-            try {
-                payload = await encryptText(shared, text);
-                encrypted = true;
-            } catch(e) { console.warn('Encrypt failed', e); }
-        } else {
-            showToast('Sending unencrypted (no key yet)', 'danger');
-        }
+        try {
+            let payload = text;
+            let encrypted = false;
+            const shared = currentMessagesState.sharedKey || await getOrCreateSharedKey(activeChatUserId);
+            if (shared) {
+                try {
+                    payload = await encryptText(shared, text);
+                    encrypted = true;
+                } catch(e) { console.warn('Encrypt failed', e); }
+            } else {
+                showToast('Sending unencrypted (no key yet)', 'danger');
+            }
 
-        await push(ref(db, `messages/${activeChatId}`), {
-            sender: currentUser.uid,
-            text: payload,
-            encrypted,
-            timestamp: serverTimestamp()
-        });
-        runTransaction(ref(db, `unreadCounts/${activeChatUserId}/${activeChatId}`), (c) => (c || 0) + 1);
-        haptic(10);
-        const sendBtn = document.getElementById('send-btn');
-        sendBtn.style.animation = 'sendPulse 0.4s ease-out';
-        setTimeout(() => sendBtn.style.animation = '', 400);
+            await push(ref(db, `messages/${activeChatId}`), {
+                sender: currentUser.uid,
+                text: payload,
+                encrypted,
+                timestamp: serverTimestamp()
+            });
+            runTransaction(ref(db, `unreadCounts/${activeChatUserId}/${activeChatId}`), (c) => (c || 0) + 1);
+            haptic(10);
+            const sendBtn = document.getElementById('send-btn');
+            sendBtn.style.animation = 'sendPulse 0.4s ease-out';
+            setTimeout(() => sendBtn.style.animation = '', 400);
+        } finally {
+            // ✅ FIX: Release lock after short delay
+            setTimeout(() => { __sendLock = false; }, 500);
+        }
     }
     document.getElementById('send-btn').addEventListener('click', sendMessage);
-    msgInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendMessage(); });
+    // ✅ FIX: Use keydown + preventDefault to stop mobile's click-after-enter
+    msgInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            e.stopPropagation();
+            sendMessage();
+        }
+    });
 
     document.getElementById('voice-call-btn').addEventListener('click', () => initiateCall('voice'));
     document.getElementById('video-call-btn').addEventListener('click', () => initiateCall('video'));
