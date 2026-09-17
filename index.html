@@ -4,8 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <meta name="theme-color" content="#121212">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <title>Ar Chats</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -222,50 +220,75 @@
     let isCaller = false, callStartTime = null, isMuted = false;
     let appInitialized = false, chatListeners = [], contactsCache = {};
 
+    // ✅ Minimal STUN, only use TURN as last resort (TURN adds latency)
     const rtcConfig = {
         iceServers: [
             { urls: 'stun:stun.l.google.com:19302' },
             { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
-            { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
-        ]
+            { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' }
+        ],
+        iceCandidatePoolSize: 10,
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require'
     };
 
-    // ✅ AUDIO FIX v2: Mono, no forced sample rate, browser defaults for processing
-    const HQ_AUDIO = {
+    // ✅ SIMPLE audio constraints - let browser handle processing
+    const AUDIO_CONSTRAINTS = {
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: true,
-        channelCount: 1,
-        // Chrome-specific hints (helps a LOT)
-        googEchoCancellation: true,
-        googAutoGainControl: true,
-        googNoiseSuppression: true,
-        googHighpassFilter: true,
-        googTypingNoiseDetection: true
+        autoGainControl: true
     };
 
     const HQ_VIDEO = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
 
-    // ✅ AUDIO FIX v2: 64kbps VBR + FEC + DTX (NOT CBR, NOT stereo)
+    // ✅ FORCE Opus codec first + tune it for lowest latency
     function tuneOpusSDP(sdp) {
         if (!sdp) return sdp;
-        return sdp.replace(/a=fmtp:(\d+)\s+minptime=(\d+);useinbandfec=(\d+)/g,
-            (m, pt) => `a=fmtp:${pt} minptime=10;useinbandfec=1;usedtx=1;stereo=0;sprop-stereo=0;maxaveragebitrate=64000;maxplaybackrate=48000`
+        
+        // Find Opus payload type
+        const opusMatch = sdp.match(/a=rtpmap:(\d+) opus\/48000/);
+        if (!opusMatch) return sdp;
+        const opusPT = opusMatch[1];
+        
+        // Move Opus to the front of the codec list in m=audio line
+        sdp = sdp.replace(
+            /(m=audio \d+ [\w\/]+\/[\w\/]+\/[\w\/]+ )(.+)/,
+            (match, prefix, codecs) => {
+                const list = codecs.split(' ').filter(c => c !== opusPT);
+                return prefix + opusPT + ' ' + list.join(' ');
+            }
         );
+        
+        // Set Opus fmtp: 64kbps, FEC on, DTX off (DTX adds latency), mono
+        sdp = sdp.replace(
+            new RegExp(`a=fmtp:${opusPT} [^\r\n]*`),
+            `a=fmtp:${opusPT} minptime=10;useinbandfec=1;usedtx=0;maxaveragebitrate=64000;maxplaybackrate=48000;stereo=0;sprop-stereo=0`
+        );
+        
+        return sdp;
     }
 
-    // ✅ AUDIO FIX v2: Softer bitrate boost (64kbps)
-    async function boostAudioBitrate(pcInstance) {
-        const sender = pcInstance.getSenders().find(s => s.track && s.track.kind === 'audio');
+    // ✅ CRITICAL: Kill jitter buffer for realtime latency
+    function killJitterBuffer(peerConnection) {
+        peerConnection.getReceivers().forEach(receiver => {
+            if (receiver.track && receiver.track.kind === 'audio') {
+                try { receiver.playoutDelayHint = 0; } catch(e) {}
+                try { receiver.jitterBufferTarget = 0; } catch(e) {}
+            }
+        });
+    }
+
+    // ✅ Mild bitrate boost
+    async function boostAudioBitrate(peerConnection) {
+        const sender = peerConnection.getSenders().find(s => s.track && s.track.kind === 'audio');
         if (!sender) return;
         try {
             const params = sender.getParameters();
             if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
-            params.encodings[0].maxBitrate = 64000;   // ← 64kbps, sweet spot
+            params.encodings[0].maxBitrate = 64000;
             params.encodings[0].priority = 'high';
             await sender.setParameters(params);
-        } catch(e) { console.warn('Audio boost failed:', e); }
+        } catch(e) { console.warn('Bitrate boost failed:', e); }
     }
 
     let ringtoneSynth = null, ringtoneLoop = null;
@@ -580,7 +603,7 @@
         showModal('call-screen');
         try {
             localStream = await navigator.mediaDevices.getUserMedia({
-                audio: HQ_AUDIO,
+                audio: AUDIO_CONSTRAINTS,
                 video: type === 'video' ? HQ_VIDEO : false
             });
         } catch (err) { alert("Could not access camera/microphone."); hideModal('call-screen'); return; }
@@ -592,6 +615,7 @@
             const rv = document.getElementById('remoteVideo');
             rv.srcObject = event.streams[0];
             rv.play().catch(e => console.log("Autoplay blocked:", e));
+            killJitterBuffer(pc);  // ✅ realtime
         };
         const callRef = ref(db, `calls/${currentCallId}`);
         const candidatesRef = child(callRef, 'callerCandidates');
@@ -610,6 +634,7 @@
                     await pc.setRemoteDescription(new RTCSessionDescription(answer));
                     callStartTime = Date.now();
                     document.getElementById('call-status').textContent = 'Connected';
+                    killJitterBuffer(pc);  // ✅ realtime again after connection
                 } catch(e) { console.error(e); }
             }
         });
@@ -647,7 +672,7 @@
         setupCallUI(call.type, call.caller);
         try {
             localStream = await navigator.mediaDevices.getUserMedia({
-                audio: HQ_AUDIO,
+                audio: AUDIO_CONSTRAINTS,
                 video: call.type === 'video' ? HQ_VIDEO : false
             });
         } catch (err) { alert("Could not access camera/microphone."); return; }
@@ -659,6 +684,7 @@
             const rv = document.getElementById('remoteVideo');
             rv.srcObject = event.streams[0];
             rv.play().catch(e => console.log("Autoplay blocked:", e));
+            killJitterBuffer(pc);  // ✅ realtime
         };
         const callRef = ref(db, `calls/${currentCallId}`);
         const calleeCandidatesRef = child(callRef, 'calleeCandidates');
@@ -671,6 +697,7 @@
             await update(callRef, { answer: { type: answer.type, sdp: answer.sdp }, status: 'connected' });
             callStartTime = Date.now();
             document.getElementById('call-status').textContent = 'Connected';
+            killJitterBuffer(pc);  // ✅ realtime
             onValue(child(callRef, 'callerCandidates'), (s) => {
                 s.forEach(c => { try { pc.addIceCandidate(new RTCIceCandidate(c.val())); } catch(e){} });
             });
