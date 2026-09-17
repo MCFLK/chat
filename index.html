@@ -133,10 +133,10 @@
 
         .message-bubble{
             max-width:78%;padding:10px 14px;border-radius:18px;font-size:clamp(0.85rem, 3.2vw, 0.9rem);font-weight:500;
-            word-wrap:break-word;overflow-wrap:anywhere;position:relative;
-            animation:msgIn 0.25s cubic-bezier(0.4,0,0.2,1);line-height:1.45;
-            transition: transform 0.15s;
+            word-wrap:break-word;overflow-wrap:anywhere;position:relative;line-height:1.45;
         }
+        /* ✅ Animation only on fresh messages (added dynamically) */
+        .message-bubble.fresh { animation: msgIn 0.25s cubic-bezier(0.4,0,0.2,1); }
         @media (hover: hover) {
             .message-bubble:hover { transform: translateY(-1px); }
         }
@@ -709,27 +709,27 @@
     let sharedKeyCache = {};
     let peerPubKeyCache = {};
 
-    // ✅ MESSAGE STATE FOR RENDERING
+    // ✅ MESSAGE STATE
     let currentMessagesState = {
-        msgs: [],
+        msgs: [],           // array of { id, sender, text, encrypted, timestamp }
         peerReadTime: 0,
         peerOnline: false,
         clearedAt: 0,
         sharedKey: null
     };
 
-    // ✅ FIX: Prevent duplicate sends
+    // ✅ INCREMENTAL RENDER: Track DOM nodes and last-known state per message
+    // Map: msgId -> { el, ticksClass, text, failed }
+    let __msgNodes = new Map();
+
+    // ✅ Send dedupe
     let __sendLock = false;
     let __lastSendText = '';
     let __lastSendTime = 0;
 
-    // ✅ FIX: Prevent duplicate openChatView calls
+    // ✅ Open chat dedupe
     let __openingChatId = null;
     let __lastOpenTime = 0;
-
-    // ✅ FIX: Render throttle
-    let __renderScheduled = false;
-    let __lastRenderKey = '';
 
     const isDesktop = () => window.matchMedia('(min-width: 1024px)').matches;
 
@@ -992,6 +992,7 @@
             activeChatUserId = null; activeChatId = null; activeChatUserData = null;
             document.getElementById('chat-action-sheet').classList.remove('open');
             document.getElementById('chat-panel').classList.remove('active');
+            __msgNodes.clear();
         }
         handleRoute();
     });
@@ -1243,7 +1244,6 @@
     }
 
     async function openChatView(friendData, updateHash = true) {
-        // ✅ FIX: Dedupe rapid openChatView calls for same chat
         const now = Date.now();
         if (__openingChatId === friendData.uid && (now - __lastOpenTime) < 400) {
             return;
@@ -1260,10 +1260,7 @@
         document.getElementById('chat-panel').classList.add('active');
         if (updateHash) navigateTo(`#chat/${friendData.userId}`);
 
-        // ✅ FIX: Properly unsubscribe previous listeners
-        if (Array.isArray(chatListeners)) {
-            chatListeners.forEach(u => { try { u(); } catch(e) {} });
-        }
+        chatListeners.forEach(u => { try { u(); } catch(e) {} });
         chatListeners = [];
 
         currentMessagesState = {
@@ -1273,18 +1270,24 @@
             clearedAt: 0,
             sharedKey: null
         };
+        __msgNodes.clear();
+        const msgContainer = document.getElementById('chat-messages');
+        if (msgContainer) msgContainer.innerHTML = '';
 
         chatListeners.push(onValue(ref(db, `status/${friendData.uid}`), (s) => {
             const st = s.val();
             const online = !!(st && st.state === 'online');
+            const wasOnline = currentMessagesState.peerOnline;
             currentMessagesState.peerOnline = online;
             document.getElementById('chat-header-status').textContent = online ? 'Online' : 'Offline';
-            scheduleRender();
+            if (wasOnline !== online) updateAllTicks();
         }));
 
         chatListeners.push(onValue(ref(db, `reads/${activeChatId}/${friendData.uid}`), (s) => {
-            currentMessagesState.peerReadTime = s.val() || 0;
-            scheduleRender();
+            const newVal = s.val() || 0;
+            const changed = newVal !== currentMessagesState.peerReadTime;
+            currentMessagesState.peerReadTime = newVal;
+            if (changed) updateAllTicks();
         }));
 
         chatListeners.push(onValue(ref(db, `typing/${activeChatId}/${activeChatUserId}`), (t) => {
@@ -1305,14 +1308,23 @@
             const shared = await getOrCreateSharedKey(friendData.uid);
             currentMessagesState.sharedKey = shared;
             updateEncryptionPill(friendData.uid);
+            // Full re-render needed because decryption may now be possible
+            __msgNodes.clear();
+            const c = document.getElementById('chat-messages');
+            if (c) c.innerHTML = '';
             scheduleRender();
         }));
 
+        // ✅ INCREMENTAL: Just update state, then schedule a diff-based render
         chatListeners.push(onValue(ref(db, `messages/${activeChatId}`), (s) => {
-            const msgs = s.val();
-            currentMessagesState.msgs = msgs
-                ? Object.values(msgs).sort((a,b) => (a.timestamp||0) - (b.timestamp||0))
-                : [];
+            const val = s.val();
+            if (val) {
+                currentMessagesState.msgs = Object.entries(val)
+                    .map(([key, m]) => ({ id: key, ...m }))
+                    .sort((a,b) => (a.timestamp||0) - (b.timestamp||0));
+            } else {
+                currentMessagesState.msgs = [];
+            }
             scheduleRender();
             markChatAsRead();
         }));
@@ -1331,14 +1343,49 @@
         scheduleRender();
     }
 
-    // ✅ FIX: Throttle renders so listeners firing 3x at once don't stack
+    // ✅ Debounce renders so multi-listener fires coalesce
+    let __renderScheduled = false;
     function scheduleRender() {
         if (__renderScheduled) return;
         __renderScheduled = true;
-        setTimeout(async () => {
+        setTimeout(() => {
             __renderScheduled = false;
-            await renderMessages();
+            renderMessages();
         }, 30);
+    }
+
+    // ✅ Update all tick icons in place (no rebuild)
+    function updateAllTicks() {
+        const { msgs, peerReadTime, peerOnline } = currentMessagesState;
+        for (const m of msgs) {
+            if (m.sender !== currentUser.uid) continue;
+            const node = __msgNodes.get(m.id);
+            if (!node) continue;
+            const want = computeTickClass(m, peerReadTime, peerOnline);
+            if (node.ticksClass !== want) {
+                node.ticksClass = want;
+                updateTickIcon(node.el, want);
+            }
+        }
+    }
+
+    function computeTickClass(m, peerReadTime, peerOnline) {
+        const msgTime = m.timestamp || 0;
+        if (peerReadTime && msgTime && msgTime <= peerReadTime) return 'seen';
+        if (peerOnline) return 'delivered';
+        return 'sent';
+    }
+
+    function updateTickIcon(el, tickClass) {
+        const tickEl = el.querySelector('.ticks');
+        if (!tickEl) return;
+        if (tickClass === 'sent') {
+            tickEl.className = 'fa-solid fa-check ticks sent';
+        } else if (tickClass === 'delivered') {
+            tickEl.className = 'fa-solid fa-check-double ticks delivered';
+        } else {
+            tickEl.className = 'fa-solid fa-check-double ticks seen';
+        }
     }
 
     function updateBlockUI() {
@@ -1375,6 +1422,7 @@
             chatListeners.forEach(u => { try { u(); } catch(e){} }); chatListeners = [];
             activeChatUserId = null; activeChatId = null; activeChatUserData = null;
             __openingChatId = null;
+            __msgNodes.clear();
             history.replaceState(null, '', '#chats');
             handleRoute();
         } else {
@@ -1397,6 +1445,9 @@
             await set(ref(db, `userChats/${currentUser.uid}/${activeChatId}/clearedAt`), serverTimestamp());
             await set(ref(db, `unreadCounts/${currentUser.uid}/${activeChatId}`), 0);
             currentMessagesState.clearedAt = Date.now();
+            __msgNodes.clear();
+            const c = document.getElementById('chat-messages');
+            if (c) c.innerHTML = '';
             haptic(30); showToast('Chat cleared for you', 'success');
             scheduleRender();
         }
@@ -1413,6 +1464,9 @@
             await remove(ref(db, `reads/${activeChatId}`));
             haptic([30, 50, 30]); showToast('All messages deleted', 'success');
             currentMessagesState.msgs = [];
+            __msgNodes.clear();
+            const c = document.getElementById('chat-messages');
+            if (c) c.innerHTML = '';
             scheduleRender();
         }
     });
@@ -1440,6 +1494,9 @@
                         await remove(ref(db, `unreadCounts/${currentUser.uid}/${activeChatId}`));
                         haptic(30); showToast('History cleared', 'success');
                         currentMessagesState.msgs = [];
+                        __msgNodes.clear();
+                        const c = document.getElementById('chat-messages');
+                        if (c) c.innerHTML = '';
                         scheduleRender();
                     }
                 }, 400);
@@ -1475,59 +1532,108 @@
         });
     }
 
+    // ============================================================
+    // ✅ INCREMENTAL RENDER: Only adds new messages, updates ticks in-place
+    // ============================================================
     async function renderMessages() {
         const container = document.getElementById('chat-messages');
         if (!container) return;
-        const isAtBottom = container.scrollHeight - container.clientHeight <= container.scrollTop + 60;
-        container.innerHTML = '';
 
         const { msgs, peerReadTime, peerOnline, clearedAt, sharedKey } = currentMessagesState;
 
-        for (const m of msgs) {
-            if (m.timestamp <= clearedAt) continue;
+        // Check if user is at bottom (before adding new items)
+        const wasAtBottom = container.scrollHeight - container.clientHeight <= container.scrollTop + 80;
 
-            const mine = m.sender === currentUser.uid;
-            const b = document.createElement('div');
-            b.className = `message-bubble ${mine ? 'me' : 'other'}`;
-            const t = m.timestamp ? new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+        // Build a set of visible message IDs
+        const visibleMsgs = msgs.filter(m => m.timestamp > clearedAt);
+        const visibleIds = new Set(visibleMsgs.map(m => m.id));
 
-            let displayText = m.text;
-            let lockIcon = '';
-            let failed = false;
-
-            if (m.encrypted) {
-                if (sharedKey) {
-                    try {
-                        displayText = await decryptText(sharedKey, m.text);
-                        lockIcon = '<i class="fa-solid fa-lock lock-icon"></i>';
-                    } catch(e) {
-                        displayText = '🔒 Encrypted message (cannot decrypt)';
-                        failed = true;
-                    }
-                } else {
-                    displayText = '🔒 Encrypted message (waiting for key)';
-                    failed = true;
-                }
+        // Remove DOM nodes for messages no longer visible (e.g., deleted)
+        for (const [id, node] of Array.from(__msgNodes.entries())) {
+            if (!visibleIds.has(id)) {
+                node.el.remove();
+                __msgNodes.delete(id);
             }
-
-            let ticksHtml = '';
-            if (mine && !failed) {
-                const msgTime = m.timestamp || Date.now();
-                if (peerReadTime && msgTime <= peerReadTime) {
-                    ticksHtml = '<i class="fa-solid fa-check-double ticks seen"></i>';
-                } else if (peerOnline) {
-                    ticksHtml = '<i class="fa-solid fa-check-double ticks delivered"></i>';
-                } else {
-                    ticksHtml = '<i class="fa-solid fa-check ticks sent"></i>';
-                }
-            }
-
-            if (failed) b.classList.add('failed-decrypt');
-            b.innerHTML = `<div>${escapeHtml(displayText)}</div><div class="message-time">${lockIcon}${t}${ticksHtml}</div>`;
-            container.appendChild(b);
         }
 
-        if (isAtBottom) container.scrollTop = container.scrollHeight;
+        // Add new messages in order
+        let addedNew = false;
+        let lastMine = false;
+
+        for (const m of visibleMsgs) {
+            let node = __msgNodes.get(m.id);
+
+            if (!node) {
+                // New message → create DOM
+                const el = document.createElement('div');
+                const mine = m.sender === currentUser.uid;
+                el.className = `message-bubble ${mine ? 'me' : 'other'} fresh`;
+                el.dataset.msgId = m.id;
+
+                // Decrypt text
+                let displayText = m.text;
+                let lockIcon = '';
+                let failed = false;
+                if (m.encrypted) {
+                    if (sharedKey) {
+                        try {
+                            displayText = await decryptText(sharedKey, m.text);
+                            lockIcon = '<i class="fa-solid fa-lock lock-icon"></i>';
+                        } catch(e) {
+                            displayText = '🔒 Encrypted message (cannot decrypt)';
+                            failed = true;
+                        }
+                    } else {
+                        displayText = '🔒 Encrypted message (waiting for key)';
+                        failed = true;
+                    }
+                }
+                if (failed) el.classList.add('failed-decrypt');
+
+                const t = m.timestamp ? new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+
+                // Build tick icon
+                let tickClassHtml = '';
+                let tickClass = null;
+                if (mine && !failed) {
+                    tickClass = computeTickClass(m, peerReadTime, peerOnline);
+                    if (tickClass === 'sent') tickClassHtml = '<i class="fa-solid fa-check ticks sent"></i>';
+                    else if (tickClass === 'delivered') tickClassHtml = '<i class="fa-solid fa-check-double ticks delivered"></i>';
+                    else tickClassHtml = '<i class="fa-solid fa-check-double ticks seen"></i>';
+                }
+
+                el.innerHTML = `<div>${escapeHtml(displayText)}</div><div class="message-time">${lockIcon}${t}${tickClassHtml}</div>`;
+
+                // Insert in sorted position (since we iterate in order, just append normally)
+                container.appendChild(el);
+
+                // Remove fresh class after animation ends (so we don't re-trigger)
+                setTimeout(() => el.classList.remove('fresh'), 400);
+
+                __msgNodes.set(m.id, { el, ticksClass: tickClass, failed, mine });
+                addedNew = true;
+                lastMine = mine;
+            } else {
+                // Existing node → just update ticks if needed
+                if (node.mine && !node.failed) {
+                    const want = computeTickClass(m, peerReadTime, peerOnline);
+                    if (node.ticksClass !== want) {
+                        node.ticksClass = want;
+                        updateTickIcon(node.el, want);
+                    }
+                }
+            }
+        }
+
+        // Reorder DOM nodes to match msg order (only if we have simple cases)
+        // Skip reorder for performance - Firebase keys are push IDs which are chronological
+
+        // Auto-scroll only if:
+        // - we added new messages AND (user was at bottom OR the last new msg is mine)
+        if (addedNew && (wasAtBottom || lastMine)) {
+            container.scrollTop = container.scrollHeight;
+        }
+
         if (iBlockedThem || theyBlockedMe) updateBlockUI();
     }
 
@@ -1545,9 +1651,8 @@
         typingTimeout = setTimeout(() => set(ref(db, `typing/${activeChatId}/${currentUser.uid}`), false), 3000);
     });
 
-    // ✅ FIX: sendMessage with dedupe lock
+    // ✅ sendMessage with dedupe lock
     async function sendMessage() {
-        // ✅ FIX: Block if already sending
         if (__sendLock) return;
 
         if (iBlockedThem || theyBlockedMe) {
@@ -1557,14 +1662,12 @@
         const text = msgInput.value.trim();
         if (!text || !activeChatId) return;
 
-        // ✅ FIX: Dedupe same text sent within 700ms (mobile fires click+keydown)
         const now = Date.now();
         if (text === __lastSendText && (now - __lastSendTime) < 700) return;
         __lastSendText = text;
         __lastSendTime = now;
 
         __sendLock = true;
-        // Clear input immediately so any duplicate handler sees empty
         msgInput.value = '';
         set(ref(db, `typing/${activeChatId}/${currentUser.uid}`), false);
 
@@ -1593,12 +1696,10 @@
             sendBtn.style.animation = 'sendPulse 0.4s ease-out';
             setTimeout(() => sendBtn.style.animation = '', 400);
         } finally {
-            // ✅ FIX: Release lock after short delay
             setTimeout(() => { __sendLock = false; }, 500);
         }
     }
     document.getElementById('send-btn').addEventListener('click', sendMessage);
-    // ✅ FIX: Use keydown + preventDefault to stop mobile's click-after-enter
     msgInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
             e.preventDefault();
