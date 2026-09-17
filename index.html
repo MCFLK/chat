@@ -81,7 +81,6 @@
         #empty-chat { display: none; }
         #middle-col { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
 
-        /* ✅ Chat panel: hidden by default, becomes overlay when active on mobile */
         #chat-panel { display: none; }
         @media (max-width: 1023px) {
             #chat-panel.active {
@@ -143,11 +142,23 @@
         }
         .message-bubble.me{align-self:flex-end;background:var(--gradient);color:#fff;border-bottom-right-radius:4px;box-shadow:0 4px 16px rgba(139,92,246,0.35);}
         .message-bubble.other{align-self:flex-start;background:var(--surface-2);color:var(--text);border-bottom-left-radius:4px;border:1px solid var(--border);}
-        .message-time{font-size:0.65rem;opacity:0.85;text-align:right;margin-top:4px;font-weight:600;letter-spacing:0.02em;display:flex;align-items:center;justify-content:flex-end;gap:4px;}
+        .message-time{font-size:0.65rem;opacity:0.9;text-align:right;margin-top:4px;font-weight:600;letter-spacing:0.02em;display:flex;align-items:center;justify-content:flex-end;gap:4px;}
         .message-time .lock-icon{font-size:0.6rem;opacity:0.9;}
         .message-bubble.other .message-time .lock-icon{color:var(--success);animation:lockGlow 3s infinite;}
         .message-bubble.me .message-time .lock-icon{color:rgba(255,255,255,0.9);}
         .message-bubble.failed-decrypt{background:rgba(244,63,94,0.15) !important;border-color:rgba(244,63,94,0.4) !important;color:var(--text-secondary) !important;font-style:italic;}
+
+        /* ✅ WHATSAPP-STYLE DELIVERY TICKS */
+        .ticks {
+            font-size: 0.72rem;
+            display: inline-flex;
+            align-items: center;
+            margin-left: 2px;
+            transition: color 0.25s ease;
+        }
+        .ticks.sent { color: rgba(255,255,255,0.55); }
+        .ticks.delivered { color: rgba(255,255,255,0.95); }
+        .ticks.seen { color: #53bdeb; }
 
         .blocked-banner{align-self:center;background:rgba(244,63,94,0.1);border:1px solid rgba(244,63,94,0.3);color:#f43f5e;padding:12px 20px;border-radius:14px;font-size:0.82rem;font-weight:700;text-align:center;margin:8px 0;max-width:90%;}
         .blocked-banner i{margin-right:6px;}
@@ -705,6 +716,15 @@
     let sharedKeyCache = {};
     let peerPubKeyCache = {};
 
+    // ✅ MESSAGE STATE FOR RENDERING
+    let currentMessagesState = {
+        msgs: [],
+        peerReadTime: 0,
+        peerOnline: false,
+        clearedAt: 0,
+        sharedKey: null
+    };
+
     const isDesktop = () => window.matchMedia('(min-width: 1024px)').matches;
 
     const rtcConfig = {
@@ -721,29 +741,20 @@
     const AUDIO_CONSTRAINTS = { echoCancellation: true, noiseSuppression: true, autoGainControl: true };
     const HQ_VIDEO = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
 
-    // =========================================================
-    // ============ E2E ENCRYPTION (ECDH + AES-GCM) ============
-    // =========================================================
+    // ===== ENCRYPTION HELPERS =====
     async function generateMyKeyPair() {
-        return await crypto.subtle.generateKey(
-            { name: 'ECDH', namedCurve: 'P-256' },
-            true,
-            ['deriveKey', 'deriveBits']
-        );
+        return await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
     }
-
     async function exportKeyPair(pair) {
         const publicJwk = await crypto.subtle.exportKey('jwk', pair.publicKey);
         const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
         return { publicJwk, privateJwk };
     }
-
     async function importKeyPair(publicJwk, privateJwk) {
         const publicKey = await crypto.subtle.importKey('jwk', publicJwk, { name: 'ECDH', namedCurve: 'P-256' }, true, []);
         const privateKey = await crypto.subtle.importKey('jwk', privateJwk, { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
         return { publicKey, privateKey };
     }
-
     function keyStorageId() { return 'bs_keys_' + currentUser.uid; }
 
     async function ensureMyKeys() {
@@ -754,7 +765,6 @@
                 const { publicJwk, privateJwk } = JSON.parse(stored);
                 myKeyPair = await importKeyPair(publicJwk, privateJwk);
             } catch(e) {
-                console.warn('Failed to restore keys, generating new', e);
                 localStorage.removeItem(keyStorageId());
             }
         }
@@ -765,9 +775,7 @@
         }
         const pubJwk = await crypto.subtle.exportKey('jwk', myKeyPair.publicKey);
         await set(ref(db, `pubkeys/${currentUser.uid}`), {
-            kty: pubJwk.kty, crv: pubJwk.crv,
-            x: pubJwk.x, y: pubJwk.y,
-            updatedAt: serverTimestamp()
+            kty: pubJwk.kty, crv: pubJwk.crv, x: pubJwk.x, y: pubJwk.y, updatedAt: serverTimestamp()
         });
         return myKeyPair;
     }
@@ -777,12 +785,9 @@
         const snap = await get(ref(db, `pubkeys/${uid}`));
         if (!snap.exists()) return null;
         const jwk = snap.val();
-        const publicKey = await crypto.subtle.importKey(
-            'jwk',
+        const publicKey = await crypto.subtle.importKey('jwk',
             { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y, ext: true },
-            { name: 'ECDH', namedCurve: 'P-256' },
-            true, []
-        );
+            { name: 'ECDH', namedCurve: 'P-256' }, true, []);
         peerPubKeyCache[uid] = publicKey;
         return publicKey;
     }
@@ -792,17 +797,12 @@
             { name: 'ECDH', public: peerPublicKey },
             myKeyPair.privateKey,
             { name: 'AES-GCM', length: 256 },
-            false,
-            ['encrypt', 'decrypt']
+            false, ['encrypt', 'decrypt']
         );
     }
 
     async function computeSafetyNumber(peerPublicKey) {
-        const bits = await crypto.subtle.deriveBits(
-            { name: 'ECDH', public: peerPublicKey },
-            myKeyPair.privateKey,
-            256
-        );
+        const bits = await crypto.subtle.deriveBits({ name: 'ECDH', public: peerPublicKey }, myKeyPair.privateKey, 256);
         const hash = await crypto.subtle.digest('SHA-256', bits);
         const arr = Array.from(new Uint8Array(hash).slice(0, 8));
         const hex = arr.map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
@@ -851,7 +851,7 @@
         }
     }
 
-    // ===== UTILITIES =====
+    // ===== UTILS =====
     function haptic(pattern = 10) { try { if (navigator.vibrate) navigator.vibrate(pattern); } catch(e) {} }
 
     let toastTimer = null;
@@ -1228,6 +1228,15 @@
         });
     }
 
+    // ✅ Mark this chat as read by me
+    async function markChatAsRead() {
+        if (!activeChatId || !currentUser) return;
+        try {
+            await set(ref(db, `reads/${activeChatId}/${currentUser.uid}`), serverTimestamp());
+            await set(ref(db, `unreadCounts/${currentUser.uid}/${activeChatId}`), 0);
+        } catch(e) { console.warn('mark read failed', e); }
+    }
+
     async function openChatView(friendData, updateHash = true) {
         activeChatUserId = friendData.uid;
         activeChatUserData = friendData;
@@ -1235,39 +1244,86 @@
         document.getElementById('chat-header-name').textContent = friendData.name;
         document.getElementById('chat-header-dp').src = friendData.dpUrl;
         document.getElementById('chat-view').classList.add('active');
-        document.getElementById('chat-panel').classList.add('active');   // ✅ Mobile fix
+        document.getElementById('chat-panel').classList.add('active');
         if (updateHash) navigateTo(`#chat/${friendData.userId}`);
-        await set(ref(db, `unreadCounts/${currentUser.uid}/${activeChatId}`), 0);
+
         chatListeners.forEach(u => u()); chatListeners = [];
 
+        // Reset message state
+        currentMessagesState = {
+            msgs: [],
+            peerReadTime: 0,
+            peerOnline: false,
+            clearedAt: 0,
+            sharedKey: null
+        };
+
+        // Peer's online status
         chatListeners.push(onValue(ref(db, `status/${friendData.uid}`), (s) => {
             const st = s.val();
-            document.getElementById('chat-header-status').textContent = (st && st.state === 'online') ? 'Online' : 'Offline';
+            const online = !!(st && st.state === 'online');
+            currentMessagesState.peerOnline = online;
+            document.getElementById('chat-header-status').textContent = online ? 'Online' : 'Offline';
+            renderMessages();
         }));
+
+        // Peer's read timestamp
+        chatListeners.push(onValue(ref(db, `reads/${activeChatId}/${friendData.uid}`), (s) => {
+            currentMessagesState.peerReadTime = s.val() || 0;
+            renderMessages();
+        }));
+
+        // Typing
         chatListeners.push(onValue(ref(db, `typing/${activeChatId}/${activeChatUserId}`), (t) => {
             const isTyping = t.val();
             document.getElementById('typing-text').textContent = isTyping ? `${friendData.name} is typing` : '';
             document.getElementById('typing-dots').classList.toggle('active', !!isTyping);
         }));
+
+        // Block status
         chatListeners.push(onValue(ref(db, `blocks/${currentUser.uid}/${friendData.uid}`), (s) => {
             iBlockedThem = s.exists(); updateBlockUI();
         }));
         chatListeners.push(onValue(ref(db, `blocks/${friendData.uid}/${currentUser.uid}`), (s) => {
             theyBlockedMe = s.exists(); updateBlockUI();
         }));
+
+        // Peer's pubkey changes → refresh shared key
         chatListeners.push(onValue(ref(db, `pubkeys/${friendData.uid}`), async () => {
-            await getOrCreateSharedKey(friendData.uid);
+            delete sharedKeyCache[activeChatId];
+            const shared = await getOrCreateSharedKey(friendData.uid);
+            currentMessagesState.sharedKey = shared;
             updateEncryptionPill(friendData.uid);
-            loadMessages();
+            renderMessages();
         }));
 
+        // Messages
+        chatListeners.push(onValue(ref(db, `messages/${activeChatId}`), (s) => {
+            const msgs = s.val();
+            currentMessagesState.msgs = msgs
+                ? Object.values(msgs).sort((a,b) => (a.timestamp||0) - (b.timestamp||0))
+                : [];
+            renderMessages();
+            // Any incoming message while we're viewing → mark read
+            markChatAsRead();
+        }));
+
+        // Cleared-at
+        const clearedAt = (await get(ref(db, `userChats/${currentUser.uid}/${activeChatId}/clearedAt`))).val() || 0;
+        currentMessagesState.clearedAt = clearedAt;
+
+        // Encryption setup
         try {
             await ensureMyKeys();
-            await getOrCreateSharedKey(friendData.uid);
+            const shared = await getOrCreateSharedKey(friendData.uid);
+            currentMessagesState.sharedKey = shared;
             await updateEncryptionPill(friendData.uid);
         } catch(e) { console.warn('Encryption setup failed', e); }
 
-        loadMessages();
+        // Mark as read NOW (opening the chat = read)
+        await markChatAsRead();
+
+        renderMessages();
     }
 
     function updateBlockUI() {
@@ -1324,8 +1380,9 @@
         if (confirm("Clear chat history for yourself? Other person will still see it.")) {
             await set(ref(db, `userChats/${currentUser.uid}/${activeChatId}/clearedAt`), serverTimestamp());
             await set(ref(db, `unreadCounts/${currentUser.uid}/${activeChatId}`), 0);
+            currentMessagesState.clearedAt = Date.now();
             haptic(30); showToast('Chat cleared for you', 'success');
-            loadMessages();
+            renderMessages();
         }
     });
 
@@ -1337,8 +1394,10 @@
             await remove(ref(db, `typing/${activeChatId}`));
             await remove(ref(db, `unreadCounts/${currentUser.uid}/${activeChatId}`));
             await remove(ref(db, `unreadCounts/${activeChatUserId}/${activeChatId}`));
+            await remove(ref(db, `reads/${activeChatId}`));
             haptic([30, 50, 30]); showToast('All messages deleted', 'success');
-            loadMessages();
+            currentMessagesState.msgs = [];
+            renderMessages();
         }
     });
 
@@ -1364,7 +1423,8 @@
                         await remove(ref(db, `messages/${activeChatId}`));
                         await remove(ref(db, `unreadCounts/${currentUser.uid}/${activeChatId}`));
                         haptic(30); showToast('History cleared', 'success');
-                        loadMessages();
+                        currentMessagesState.msgs = [];
+                        renderMessages();
                     }
                 }, 400);
             }
@@ -1399,53 +1459,65 @@
         });
     }
 
-    async function loadMessages() {
+    // ✅ RENDER MESSAGES (with ticks)
+    async function renderMessages() {
         const container = document.getElementById('chat-messages');
+        if (!container) return;
+        const isAtBottom = container.scrollHeight - container.clientHeight <= container.scrollTop + 60;
         container.innerHTML = '';
-        const clearedAt = (await get(ref(db, `userChats/${currentUser.uid}/${activeChatId}/clearedAt`))).val() || 0;
-        const shared = await getOrCreateSharedKey(activeChatUserId);
 
-        chatListeners.push(onValue(ref(db, `messages/${activeChatId}`), async (s) => {
-            const isAtBottom = container.scrollHeight - container.clientHeight <= container.scrollTop + 60;
-            container.innerHTML = '';
-            const msgs = s.val();
-            if (msgs) {
-                const sorted = Object.values(msgs).sort((a,b) => (a.timestamp||0) - (b.timestamp||0));
-                for (const m of sorted) {
-                    if (m.timestamp > clearedAt) {
-                        const b = document.createElement('div');
-                        const mine = m.sender === currentUser.uid;
-                        b.className = `message-bubble ${mine ? 'me' : 'other'}`;
-                        const t = m.timestamp ? new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+        const { msgs, peerReadTime, peerOnline, clearedAt, sharedKey } = currentMessagesState;
 
-                        let displayText = m.text;
-                        let lockIcon = '';
-                        let failed = false;
+        for (const m of msgs) {
+            if (m.timestamp <= clearedAt) continue;
 
-                        if (m.encrypted) {
-                            if (shared) {
-                                try {
-                                    displayText = await decryptText(shared, m.text);
-                                    lockIcon = '<i class="fa-solid fa-lock lock-icon"></i>';
-                                } catch(e) {
-                                    displayText = '🔒 Encrypted message (cannot decrypt)';
-                                    failed = true;
-                                }
-                            } else {
-                                displayText = '🔒 Encrypted message (waiting for key)';
-                                failed = true;
-                            }
-                        }
+            const mine = m.sender === currentUser.uid;
+            const b = document.createElement('div');
+            b.className = `message-bubble ${mine ? 'me' : 'other'}`;
+            const t = m.timestamp ? new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
 
-                        if (failed) b.classList.add('failed-decrypt');
-                        b.innerHTML = `<div>${escapeHtml(displayText)}</div><div class="message-time">${lockIcon}${t}</div>`;
-                        container.appendChild(b);
+            let displayText = m.text;
+            let lockIcon = '';
+            let failed = false;
+
+            if (m.encrypted) {
+                if (sharedKey) {
+                    try {
+                        displayText = await decryptText(sharedKey, m.text);
+                        lockIcon = '<i class="fa-solid fa-lock lock-icon"></i>';
+                    } catch(e) {
+                        displayText = '🔒 Encrypted message (cannot decrypt)';
+                        failed = true;
                     }
+                } else {
+                    displayText = '🔒 Encrypted message (waiting for key)';
+                    failed = true;
                 }
-                if (isAtBottom) container.scrollTop = container.scrollHeight;
             }
-            if (iBlockedThem || theyBlockedMe) updateBlockUI();
-        }));
+
+            // ✅ TICKS: 1 grey / 2 grey / 2 blue
+            let ticksHtml = '';
+            if (mine && !failed) {
+                const msgTime = m.timestamp || Date.now();
+                if (peerReadTime && msgTime <= peerReadTime) {
+                    // Recipient has read it → blue double ticks
+                    ticksHtml = '<i class="fa-solid fa-check-double ticks seen"></i>';
+                } else if (peerOnline) {
+                    // Recipient is online → grey double ticks
+                    ticksHtml = '<i class="fa-solid fa-check-double ticks delivered"></i>';
+                } else {
+                    // Sent only → grey single tick
+                    ticksHtml = '<i class="fa-solid fa-check ticks sent"></i>';
+                }
+            }
+
+            if (failed) b.classList.add('failed-decrypt');
+            b.innerHTML = `<div>${escapeHtml(displayText)}</div><div class="message-time">${lockIcon}${t}${ticksHtml}</div>`;
+            container.appendChild(b);
+        }
+
+        if (isAtBottom) container.scrollTop = container.scrollHeight;
+        if (iBlockedThem || theyBlockedMe) updateBlockUI();
     }
 
     function escapeHtml(str) {
@@ -1474,14 +1546,12 @@
 
         let payload = text;
         let encrypted = false;
-        const shared = await getOrCreateSharedKey(activeChatUserId);
+        const shared = currentMessagesState.sharedKey || await getOrCreateSharedKey(activeChatUserId);
         if (shared) {
             try {
                 payload = await encryptText(shared, text);
                 encrypted = true;
-            } catch(e) {
-                console.warn('Encrypt failed, sending plaintext', e);
-            }
+            } catch(e) { console.warn('Encrypt failed', e); }
         } else {
             showToast('Sending unencrypted (no key yet)', 'danger');
         }
