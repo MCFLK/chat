@@ -78,9 +78,20 @@
         }
 
         #desktop-rail { display: none; }
-        #chat-panel { display: none; }
         #empty-chat { display: none; }
         #middle-col { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+
+        /* ✅ Chat panel: hidden by default, becomes overlay when active on mobile */
+        #chat-panel { display: none; }
+        @media (max-width: 1023px) {
+            #chat-panel.active {
+                display: block;
+                position: absolute;
+                inset: 0;
+                z-index: 20;
+                background: #0f0f16;
+            }
+        }
 
         header{
             background:rgba(22,22,30,0.75);backdrop-filter:blur(20px) saturate(180%);-webkit-backdrop-filter:blur(20px) saturate(180%);
@@ -330,7 +341,6 @@
         .ripple-host{position:relative;overflow:hidden;}
         .ripple-host .ripple-circle{position:absolute;border-radius:50%;background:rgba(139,92,246,0.5);transform:scale(0);animation:rippleAnim 0.6s ease-out;pointer-events:none;z-index:999;}
 
-        /* Encryption status pill in chat header */
         .enc-pill {
             display: inline-flex;
             align-items: center;
@@ -350,11 +360,7 @@
         .enc-pill.pending { background: rgba(251,191,36,0.15); color: #fbbf24; border: 1px solid rgba(251,191,36,0.35); }
         .enc-pill:active { transform: scale(0.94); }
 
-        /* Encryption info modal */
-        .enc-info {
-            text-align: center;
-            padding: 12px 0;
-        }
+        .enc-info { text-align: center; padding: 12px 0; }
         .enc-shield {
             width: 84px; height: 84px;
             margin: 0 auto 20px;
@@ -366,19 +372,8 @@
             box-shadow: 0 0 30px rgba(16,185,129,0.3);
             animation: pulse 2.5s ease-in-out infinite;
         }
-        .enc-title {
-            font-size: 1.1rem;
-            font-weight: 800;
-            letter-spacing: -0.01em;
-            margin-bottom: 6px;
-        }
-        .enc-sub {
-            font-size: 0.82rem;
-            color: var(--text-secondary);
-            font-weight: 500;
-            margin-bottom: 20px;
-            line-height: 1.5;
-        }
+        .enc-title { font-size: 1.1rem; font-weight: 800; letter-spacing: -0.01em; margin-bottom: 6px; }
+        .enc-sub { font-size: 0.82rem; color: var(--text-secondary); font-weight: 500; margin-bottom: 20px; line-height: 1.5; }
         .safety-number {
             background: var(--surface-2);
             border: 1px solid var(--border);
@@ -393,12 +388,7 @@
             word-break: break-all;
             line-height: 1.6;
         }
-        .safety-hint {
-            font-size: 0.75rem;
-            color: var(--text-muted);
-            font-weight: 500;
-            line-height: 1.5;
-        }
+        .safety-hint { font-size: 0.75rem; color: var(--text-muted); font-weight: 500; line-height: 1.5; }
 
         @media (min-width: 1024px) {
             body { background: #0a0a0f; background-image: none; display: block; }
@@ -427,7 +417,7 @@
             #main-header h1 { font-size: 1.4rem; }
             #main-header #open-menu-btn { display: none; }
             #list-views { flex: 1; position: relative; }
-            #chat-panel { grid-column: 3; display: block; position: relative; background: #0f0f16; overflow: hidden; }
+            #chat-panel { display: block; grid-column: 3; position: relative; background: #0f0f16; overflow: hidden; }
             #empty-chat { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; text-align: center; padding: 40px; gap: 16px; animation: fadeIn 0.5s ease; }
             #empty-chat i { font-size: 4rem; background: var(--gradient); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; margin-bottom: 8px; animation: glow 3s ease-in-out infinite; }
             #empty-chat h3 { font-size: 1.5rem; font-weight: 800; letter-spacing: -0.02em; color: var(--text); }
@@ -638,7 +628,6 @@
     <div id="blocked-list"></div>
 </div>
 
-<!-- Encryption Info Modal -->
 <div class="modal" id="encryption-modal">
     <div class="modal-header"><h2>Encryption</h2><button class="icon-btn ripple-host" id="close-encryption-btn"><i class="fa-solid fa-xmark"></i></button></div>
     <div class="enc-info">
@@ -712,9 +701,9 @@
     let iBlockedThem = false, theyBlockedMe = false;
 
     // ===== ENCRYPTION STATE =====
-    let myKeyPair = null;             // { publicKey, privateKey } CryptoKey objects
-    let sharedKeyCache = {};          // chatId -> { key: CryptoKey, safetyNumber: string }
-    let peerPubKeyCache = {};         // uid -> publicKey (CryptoKey)
+    let myKeyPair = null;
+    let sharedKeyCache = {};
+    let peerPubKeyCache = {};
 
     const isDesktop = () => window.matchMedia('(min-width: 1024px)').matches;
 
@@ -735,15 +724,12 @@
     // =========================================================
     // ============ E2E ENCRYPTION (ECDH + AES-GCM) ============
     // =========================================================
-
-    // -- Key pair generation & persistence --
     async function generateMyKeyPair() {
-        const pair = await crypto.subtle.generateKey(
+        return await crypto.subtle.generateKey(
             { name: 'ECDH', namedCurve: 'P-256' },
             true,
             ['deriveKey', 'deriveBits']
         );
-        return pair;
     }
 
     async function exportKeyPair(pair) {
@@ -753,16 +739,8 @@
     }
 
     async function importKeyPair(publicJwk, privateJwk) {
-        const publicKey = await crypto.subtle.importKey(
-            'jwk', publicJwk,
-            { name: 'ECDH', namedCurve: 'P-256' },
-            true, []
-        );
-        const privateKey = await crypto.subtle.importKey(
-            'jwk', privateJwk,
-            { name: 'ECDH', namedCurve: 'P-256' },
-            true, ['deriveKey', 'deriveBits']
-        );
+        const publicKey = await crypto.subtle.importKey('jwk', publicJwk, { name: 'ECDH', namedCurve: 'P-256' }, true, []);
+        const privateKey = await crypto.subtle.importKey('jwk', privateJwk, { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey', 'deriveBits']);
         return { publicKey, privateKey };
     }
 
@@ -785,7 +763,6 @@
             const { publicJwk, privateJwk } = await exportKeyPair(myKeyPair);
             localStorage.setItem(keyStorageId(), JSON.stringify({ publicJwk, privateJwk }));
         }
-        // Publish public key to Firebase
         const pubJwk = await crypto.subtle.exportKey('jwk', myKeyPair.publicKey);
         await set(ref(db, `pubkeys/${currentUser.uid}`), {
             kty: pubJwk.kty, crv: pubJwk.crv,
@@ -810,7 +787,6 @@
         return publicKey;
     }
 
-    // -- Shared key derivation (ECDH) --
     async function deriveSharedKey(peerPublicKey) {
         return await crypto.subtle.deriveKey(
             { name: 'ECDH', public: peerPublicKey },
@@ -821,9 +797,7 @@
         );
     }
 
-    // -- Safety number (fingerprint) --
     async function computeSafetyNumber(peerPublicKey) {
-        // Derive raw bits and hash them
         const bits = await crypto.subtle.deriveBits(
             { name: 'ECDH', public: peerPublicKey },
             myKeyPair.privateKey,
@@ -846,15 +820,10 @@
         return sharedKeyCache[chatId];
     }
 
-    // -- Message encryption/decryption --
     async function encryptText(sharedKeyObj, plaintext) {
         const iv = crypto.getRandomValues(new Uint8Array(12));
         const encoded = new TextEncoder().encode(plaintext);
-        const ct = await crypto.subtle.encrypt(
-            { name: 'AES-GCM', iv },
-            sharedKeyObj.key,
-            encoded
-        );
+        const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, sharedKeyObj.key, encoded);
         const ivB64 = btoa(String.fromCharCode(...iv));
         const ctB64 = btoa(String.fromCharCode(...new Uint8Array(ct)));
         return ivB64 + ':' + ctB64;
@@ -864,15 +833,10 @@
         const [ivB64, ctB64] = payload.split(':');
         const iv = Uint8Array.from(atob(ivB64), c => c.charCodeAt(0));
         const ct = Uint8Array.from(atob(ctB64), c => c.charCodeAt(0));
-        const pt = await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv },
-            sharedKeyObj.key,
-            ct
-        );
+        const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, sharedKeyObj.key, ct);
         return new TextDecoder().decode(pt);
     }
 
-    // -- Update the encryption status pill in the chat header --
     async function updateEncryptionPill(peerUid) {
         const pill = document.getElementById('enc-pill');
         const text = document.getElementById('enc-pill-text');
@@ -887,7 +851,7 @@
         }
     }
 
-    // ===== OTHER UTILITIES =====
+    // ===== UTILITIES =====
     function haptic(pattern = 10) { try { if (navigator.vibrate) navigator.vibrate(pattern); } catch(e) {} }
 
     let toastTimer = null;
@@ -985,6 +949,7 @@
         const hash = location.hash || '#chats';
 
         document.getElementById('chat-view').classList.remove('active');
+        document.getElementById('chat-panel').classList.remove('active');
         document.querySelectorAll('.nav-item').forEach(b => b.classList.remove('active'));
         document.querySelectorAll('.list-view').forEach(v => v.classList.remove('active'));
         document.querySelectorAll('.rail-btn').forEach(b => b.classList.remove('active'));
@@ -1020,6 +985,7 @@
             chatListeners.forEach(u => u()); chatListeners = [];
             activeChatUserId = null; activeChatId = null; activeChatUserData = null;
             document.getElementById('chat-action-sheet').classList.remove('open');
+            document.getElementById('chat-panel').classList.remove('active');
         }
         handleRoute();
     });
@@ -1067,7 +1033,6 @@
             else {
                 currentUserData = snap.val();
                 loadUserDataUI();
-                // Initialize encryption keys (this publishes public key)
                 try { await ensureMyKeys(); } catch(e) { console.error('Key init failed', e); }
                 if (!appInitialized) {
                     appInitialized = true;
@@ -1131,7 +1096,6 @@
         });
     }
 
-    // ===== MY ENCRYPTION (side menu button) =====
     document.getElementById('my-encryption-btn').addEventListener('click', async () => {
         closeSideMenu();
         await showMyEncryptionInfo();
@@ -1140,17 +1104,16 @@
     async function showMyEncryptionInfo() {
         document.getElementById('enc-modal-title').textContent = 'Your Encryption Key';
         document.getElementById('enc-modal-sub').textContent = 'Your private key is stored only on this device. It never leaves your browser.';
-        document.getElementById('safety-number').textContent = 'PRIVATE KEY';
-        // Show truncated public key
         if (myKeyPair) {
             const jwk = await crypto.subtle.exportKey('jwk', myKeyPair.publicKey);
             const short = (jwk.x.slice(0, 16) + '...' + jwk.x.slice(-16)).toUpperCase();
             document.getElementById('safety-number').textContent = short.match(/.{1,4}/g).join(' ');
+        } else {
+            document.getElementById('safety-number').textContent = 'PRIVATE KEY';
         }
         showModal('encryption-modal');
     }
 
-    // ===== ENCRYPTION INFO (chat menu) =====
     document.getElementById('menu-enc-info').addEventListener('click', async () => {
         document.getElementById('chat-action-sheet').classList.remove('open');
         if (!activeChatUserId) return;
@@ -1173,7 +1136,6 @@
 
     document.getElementById('close-encryption-btn').addEventListener('click', () => hideModal('encryption-modal'));
 
-    // Click on the enc pill in chat header
     document.getElementById('enc-pill').addEventListener('click', async () => {
         if (activeChatUserId) await showChatEncryptionInfo(activeChatUserId);
     });
@@ -1273,6 +1235,7 @@
         document.getElementById('chat-header-name').textContent = friendData.name;
         document.getElementById('chat-header-dp').src = friendData.dpUrl;
         document.getElementById('chat-view').classList.add('active');
+        document.getElementById('chat-panel').classList.add('active');   // ✅ Mobile fix
         if (updateHash) navigateTo(`#chat/${friendData.userId}`);
         await set(ref(db, `unreadCounts/${currentUser.uid}/${activeChatId}`), 0);
         chatListeners.forEach(u => u()); chatListeners = [];
@@ -1292,14 +1255,12 @@
         chatListeners.push(onValue(ref(db, `blocks/${friendData.uid}/${currentUser.uid}`), (s) => {
             theyBlockedMe = s.exists(); updateBlockUI();
         }));
-        // Watch peer's public key changes (they may publish after we open)
         chatListeners.push(onValue(ref(db, `pubkeys/${friendData.uid}`), async () => {
             await getOrCreateSharedKey(friendData.uid);
             updateEncryptionPill(friendData.uid);
-            loadMessages(); // Re-render to decrypt any newly readable messages
+            loadMessages();
         }));
 
-        // Set up encryption for this chat
         try {
             await ensureMyKeys();
             await getOrCreateSharedKey(friendData.uid);
@@ -1339,6 +1300,7 @@
     document.getElementById('close-chat-btn').addEventListener('click', () => {
         if (isDesktop()) {
             document.getElementById('chat-view').classList.remove('active');
+            document.getElementById('chat-panel').classList.remove('active');
             chatListeners.forEach(u => u()); chatListeners = [];
             activeChatUserId = null; activeChatId = null; activeChatUserData = null;
             history.replaceState(null, '', '#chats');
@@ -1437,7 +1399,6 @@
         });
     }
 
-    // ===== MESSAGES (with encryption) =====
     async function loadMessages() {
         const container = document.getElementById('chat-messages');
         container.innerHTML = '';
@@ -1474,9 +1435,6 @@
                                 displayText = '🔒 Encrypted message (waiting for key)';
                                 failed = true;
                             }
-                        } else {
-                            // Legacy plaintext
-                            lockIcon = '';
                         }
 
                         if (failed) b.classList.add('failed-decrypt');
@@ -1514,7 +1472,6 @@
         msgInput.value = '';
         set(ref(db, `typing/${activeChatId}/${currentUser.uid}`), false);
 
-        // Try to encrypt
         let payload = text;
         let encrypted = false;
         const shared = await getOrCreateSharedKey(activeChatUserId);
@@ -1544,7 +1501,6 @@
     document.getElementById('send-btn').addEventListener('click', sendMessage);
     msgInput.addEventListener('keypress', (e) => { if (e.key === 'Enter') sendMessage(); });
 
-    // ===== CALLS =====
     document.getElementById('voice-call-btn').addEventListener('click', () => initiateCall('voice'));
     document.getElementById('video-call-btn').addEventListener('click', () => initiateCall('video'));
 
