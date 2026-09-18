@@ -95,6 +95,7 @@ header h1{font-size:clamp(1.1rem,4vw,1.25rem);font-weight:800;background:var(--g
 .msg-wrap{position:relative;display:flex;flex-direction:column;max-width:78%;align-self:flex-start;width:fit-content;scroll-margin-top:80px}
 .msg-wrap.mine{align-self:flex-end;align-items:flex-end}
 .msg-wrap.other{align-items:flex-start}
+.msg-wrap.grouped{margin-top:-8px}
 .msg-wrap.highlight .message-bubble{animation:highlightPulse 1.5s ease-out}
 .msg-swipe-hint{position:absolute;left:-36px;top:50%;transform:translateY(-50%);color:var(--primary-2);font-size:1.1rem;opacity:0;pointer-events:none}
 .msg-wrap.swiping .msg-swipe-hint{animation:swipeArrowPulse 0.6s ease-in-out infinite}
@@ -104,6 +105,10 @@ header h1{font-size:clamp(1.1rem,4vw,1.25rem);font-weight:800;background:var(--g
 .message-bubble.flying-back{animation:msgSpringBack 0.35s cubic-bezier(0.34,1.56,0.64,1) forwards}
 .message-bubble.me{background:var(--gradient);color:#fff;border-bottom-right-radius:6px;box-shadow:0 8px 22px rgba(124,92,255,0.35)}
 .message-bubble.other{background:rgba(255,255,255,0.045);backdrop-filter:blur(10px);color:var(--text);border-bottom-left-radius:6px;border:1px solid var(--border)}
+.message-bubble.me.grp-top{border-top-right-radius:6px}
+.message-bubble.me.grp-bottom{border-bottom-right-radius:22px}
+.message-bubble.other.grp-top{border-top-left-radius:6px}
+.message-bubble.other.grp-bottom{border-bottom-left-radius:22px}
 .message-bubble.pressed{transform:scale(0.96);background:rgba(124,92,255,0.25)!important}
 .message-bubble.gif-bubble{padding:6px;background:var(--surface-2);border:1px solid var(--border)}
 .gif-msg{max-width:220px;border-radius:14px;display:block;background:#000}
@@ -781,6 +786,16 @@ function navigateTo(hash, replace = false) { if (replace) { history.replaceState
 // Grabs the first Unicode grapheme-ish chunk (handles surrogate pairs) instead of
 // slicing raw UTF-16 code units, which used to mangle multi-byte emoji avatars.
 function firstChars(str, count) { return Array.from(str || '').slice(0, count).join(''); }
+// Human-friendly "last seen" formatting for a peer's presence timestamp.
+function formatLastSeen(ts) {
+    if (!ts) return 'a while ago';
+    const now = new Date(); const d = new Date(ts);
+    const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    if (now.toDateString() === d.toDateString()) return `today at ${time}`;
+    const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+    if (yesterday.toDateString() === d.toDateString()) return `yesterday at ${time}`;
+    return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })} at ${time}`;
+}
 
 /* ============================================================
    UI GLOBAL LISTENERS
@@ -1069,7 +1084,7 @@ function listenForContacts() {
             item.innerHTML = `<img src="${fd.dpUrl}" class="avatar"><div class="list-details"><div class="list-title"><span>${escapeHtml(fd.name)}</span><span class="status-dot offline" id="dot-${fu}"></span></div><div class="list-subtitle">${escapeHtml(fd.userId)}</div></div><div id="unread-${chatId}" class="badge" style="display:none;position:relative;right:0">0</div>`;
             item.addEventListener('click', () => navigateTo(`#chat/${fd.userId}`));
             c.appendChild(item);
-            onValue(ref(db, `status/${fu}`), s => { const st = s.val(); const d = document.getElementById(`dot-${fu}`); if (d && st) d.className = `status-dot ${st.state === 'online' ? 'online' : 'offline'}`; });
+            onValue(ref(db, `status/${fu}`), s => { const st = s.val(); const d = document.getElementById(`dot-${fu}`); if (d && st) { d.className = `status-dot ${st.state === 'online' ? 'online' : 'offline'}`; d.title = st.state === 'online' ? 'Online' : (st.last_changed ? `Last seen ${formatLastSeen(st.last_changed)}` : 'Offline'); } });
             onValue(ref(db, `unreadCounts/${currentUser.uid}/${chatId}`), u => { const n = u.val() || 0; const bd = document.getElementById(`unread-${chatId}`); if (bd) { bd.textContent = n; bd.style.display = n > 0 ? 'inline-block' : 'none'; } });
         }
         if (location.hash.startsWith('#chat/')) handleRoute();
@@ -1429,7 +1444,7 @@ async function openChatView(friendData, updateHash = true) {
         const st = s.val(); const online = !!(st && st.state === 'online');
         const wasOnline = currentMessagesState.peerOnline;
         currentMessagesState.peerOnline = online;
-        document.getElementById('chat-header-status').textContent = online ? 'Online' : 'Offline';
+        document.getElementById('chat-header-status').textContent = online ? 'Online' : (st && st.last_changed ? `Last seen ${formatLastSeen(st.last_changed)}` : 'Offline');
         if (wasOnline !== online) updateAllTicks();
     }));
     chatListeners.push(onValue(ref(db, `reads/${activeChatId}/${friendData.uid}`), s => {
@@ -1852,7 +1867,18 @@ async function renderMessages() {
     }
     let addedNew = false, lastMine = false;
 
-    for (const m of visibleMsgs) {
+    const GROUP_WINDOW = 60000;
+    const groupInfo = visibleMsgs.map((mm, idx) => {
+        const prev = visibleMsgs[idx - 1];
+        const next = visibleMsgs[idx + 1];
+        return {
+            sameAsPrev: !!(prev && prev.sender === mm.sender && (mm.timestamp - prev.timestamp) < GROUP_WINDOW),
+            sameAsNext: !!(next && next.sender === mm.sender && (next.timestamp - mm.timestamp) < GROUP_WINDOW)
+        };
+    });
+
+    for (let msgIndex = 0; msgIndex < visibleMsgs.length; msgIndex++) {
+        const m = visibleMsgs[msgIndex];
         let node = __msgNodes.get(m.id);
         if (!node) {
             const wrap = document.createElement('div');
@@ -1943,6 +1969,12 @@ async function renderMessages() {
                 }
             }
         }
+
+        // Group consecutive messages from the same sender sent close together
+        const gInfo = groupInfo[msgIndex];
+        node.wrap.classList.toggle('grouped', !!gInfo.sameAsPrev);
+        node.el.classList.toggle('grp-top', !!gInfo.sameAsPrev);
+        node.el.classList.toggle('grp-bottom', !!gInfo.sameAsNext);
     }
     if (addedNew && (wasAtBottom || lastMine)) container.scrollTop = container.scrollHeight;
     if (iBlockedThem || theyBlockedMe) updateBlockUI();
